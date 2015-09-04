@@ -1,0 +1,137 @@
+#!/usr/bin/python3
+
+# fixpoint: Look for an infinite fixed point of any program
+#
+# Examples:
+#   fixpoint base64
+#   fixpoint gpg --enarmor 2>/dev/null
+#   fixpoint hexdump
+#   fixpoint od
+#   fixpoint xxd
+#   fixpoint nl
+#   fixpoint pr -D ''
+#   fixpoint lzma
+#   fixpoint cowsay
+#   fixpoint cowthink
+#   fixpoint bcd
+#   fixpoint ppt
+#
+# Copyright © Anders Kaseorg <andersk@mit.edu>
+#
+# Permission is hereby granted, free of charge, to any person
+# obtaining a copy of this software and associated documentation files
+# (the "Software"), to deal in the Software without restriction,
+# including without limitation the rights to use, copy, modify, merge,
+# publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so,
+# subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+# BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import binascii
+import fcntl
+import hashlib
+import os
+import psutil
+import selectors
+import subprocess
+import sys
+
+cmd = sys.argv[1:]
+buf = b''
+fbytes = 0
+seed = {}
+
+while True:
+
+    with subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as pipe, \
+         selectors.SelectSelector() as sel:
+
+        ps = psutil.Process(pipe.pid)
+        for f in [pipe.stdin, pipe.stdout]:
+            fcntl.fcntl(f, fcntl.F_SETFL, fcntl.fcntl(f, fcntl.F_GETFL) | os.O_NONBLOCK)
+        sel.register(pipe.stdout, selectors.EVENT_READ, 'r')
+        if buf:
+            sel.register(pipe.stdin, selectors.EVENT_WRITE, 'w')
+
+        wbytes = 0
+        rbytes = 0
+        bad = None
+        wclosed = False
+        rclosed = False
+
+        while rbytes <= len(buf) and not rclosed and not bad:
+
+            blocked = False
+            while True:
+                events = sel.select(timeout=2 if wbytes < len(buf) else 0.0001)
+                if events:
+                    break
+                elif ps.status() == psutil.STATUS_RUNNING:
+                    blocked = False
+                elif blocked:
+                    break
+                else:
+                    blocked = True
+
+            if not events:
+                if wclosed:
+                    break
+                assert wbytes == len(buf)
+                pipe.stdin.close()
+                wclosed = True
+
+            for key, mask in events:
+                if key.data == 'r':
+                    s = pipe.stdout.read()
+                    if not s:
+                        rclosed = True
+                        break
+                    if bad is None:
+                        for i, (b1, b2) in enumerate(zip(s, buf[rbytes:max(wbytes, rbytes + len(s))])):
+                            if b1 != b2:
+                                bad = rbytes + i
+                                assert bad >= fbytes
+                                break
+                    rbytes += len(s)
+                    if rbytes > len(buf) and not wclosed and wbytes == len(buf):
+                        sel.register(pipe.stdin, selectors.EVENT_WRITE, 'w')
+                    buf = buf[:rbytes - len(s)] + s + buf[rbytes:]
+                    ok = rbytes if bad is None else bad
+                    if wclosed:
+                        ok = min(wbytes, ok)
+                    if ok > fbytes:
+                        sys.stdout.buffer.write(buf[fbytes:ok])
+                        sys.stdout.buffer.flush()
+                        fbytes = ok
+                elif key.data == 'w':
+                    wbytes += os.write(pipe.stdin.fileno(), buf[wbytes:])
+                    if wbytes == len(buf):
+                        sel.unregister(pipe.stdin)
+
+        hint = 0
+        if bad is not None:
+            hint = buf[bad]
+            buf = buf[:bad]
+
+        while True:
+            hash = hashlib.sha1(buf).digest()
+            if hash in seed:
+                x = seed[hash] or ~(~0 << 256)
+                if not x & (1 << hint):
+                    hint = (x & -x).bit_length() - 1
+                buf += bytes([hint])
+                seed[hash] = x & ~(1 << hint)
+            else:
+                seed[hash] = 0
+                break
